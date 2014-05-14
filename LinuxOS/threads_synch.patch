@@ -1,0 +1,2679 @@
+Index: user.h
+===================================================================
+--- user.h	(revision 2)
++++ user.h	(working copy)
+@@ -22,6 +22,21 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int kthread_create(void(*start_func)(), void* stack, uint stack_size);
++int kthread_id();
++void kthread_exit();
++int kthread_join(int thread_id);
++int kthread_mutex_alloc(void);
++int kthread_mutex_dealloc( int mutex_id );
++int kthread_mutex_lock( int mutex_id );
++int kthread_mutex_unlock( int mutex_id );
++int kthread_cond_alloc();
++int kthread_cond_dealloc( int cond_id );
++int kthread_cond_wait( int cond_id, int mutex_id );
++int kthread_cond_signal( int cond_id );
++int retrieve_process_statistics( int* totalElapsedTime, 
++				 int* totalRunTime,
++				 int* totalWaitTime);
+ 
+ // ulib.c
+ int stat(char*, struct stat*);
+@@ -36,3 +51,4 @@
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++char* itoa(int xx, char* buff);
+\ No newline at end of file
+Index: uthread_sanity.c
+===================================================================
+--- uthread_sanity.c	(revision 0)
++++ uthread_sanity.c	(revision 0)
+@@ -0,0 +1,39 @@
++#include "types.h"
++#include "uthread.h"
++#include "user.h"
++
++
++int k = 0;
++
++void start_function() {
++  int i;
++  for(i = 0; i < k; i++) {
++    printf(1, "thread %d iteration %d\n", uthread_self().tid, i);
++    uthread_yield();
++  }
++}
++
++int main(int argc, char **argv) {
++  int i;
++  int n = 0;
++  if(argc != 3) {
++    printf(2, "error: number of arguments\n");
++    exit();
++  }
++  n = atoi(argv[1]);
++  k = atoi(argv[2]);
++  
++  for(i = 0; i < n; i++) {
++    if(uthread_create(start_function, 0) < 0) {
++      printf(2, "error: create uthread failed\n");
++      exit();
++    }
++  }
++  if(uthread_start_all() == -1) {
++    printf(2, "error: start all failed\n");
++    exit();
++  }
++  exit();
++}
++
++
+
+Property changes on: uthread_sanity.c
+___________________________________________________________________
+Added: svn:executable
+   + *
+
+Index: Makefile
+===================================================================
+--- Makefile	(revision 2)
++++ Makefile	(working copy)
+@@ -75,6 +75,8 @@
+ #CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
+ CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++##SCHEDFLAG = -DSCHED_PB
++CFLAGS += $(SCHEDFLAG)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+ LDFLAGS += -m $(shell $(LD) -V | grep elf_i386 2>/dev/null)
+@@ -132,7 +134,7 @@
+ vectors.S: vectors.pl
+ 	perl vectors.pl > vectors.S
+ 
+-ULIB = ulib.o usys.o printf.o umalloc.o
++ULIB = ulib.o usys.o printf.o umalloc.o uthread.o
+ 
+ _%: %.o $(ULIB)
+ 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
+@@ -164,10 +166,16 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_uthread_sanity\
++	_rs\
++	_ult_rs\
++	
++	
++	
++	
++fs.img: mkfs README ass2_conf.txt $(UPROGS)
++	./mkfs fs.img README ass2_conf.txt $(UPROGS)
+ 
+-fs.img: mkfs README $(UPROGS)
+-	./mkfs fs.img README $(UPROGS)
+-
+ -include *.d
+ 
+ clean: 
+@@ -233,8 +241,9 @@
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+-	printf.c umalloc.c\
+-	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
++	printf.c umalloc.c uthread.c uthread_sanity.c\
++	rs.h rs.c ult_rs.c\
++	README ass2_conf.txt dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+ 
+ dist:
+Index: rs.c
+===================================================================
+--- rs.c	(revision 0)
++++ rs.c	(revision 0)
+@@ -0,0 +1,617 @@
++#include "types.h"
++#include "user.h"
++#include "fcntl.h"
++#include "rs.h"
++
++///////////////////////////////////////////// global variables ///////////////////////////////////////////////////////////////
++int output_mutex;
++int logfile; // file descriptor
++struct BufferState buffers[LOCKS_NUM];
++
++// list of thread id of student's thread
++// only host access this
++int dining_threads[MAX_THREADS]; 
++int running = 1;
++int running_mutex = 0;
++
++struct Conf *conf;
++// statistics variables
++// protect statistics variables
++int stats_mutex = 0;
++// sum of all klts' run time
++float klt_rtime_sum = 0;
++float klt_wtime_sum = 0;
++int start_time = 0;
++
++////////////////////////////////////////////// read from file ///////////////////////////////////////////////////////////////////
++
++// reads a line into buf with  maximum max characters
++// return number of characters read
++int readline(int fd, char *buf, int max){
++  char *p = buf;
++  int n = 0;
++  int count = 0;
++
++  while((count < max) && ((n = read(fd, p, 1)) > 0)){
++	
++	if(*p == NEWLINE){ // reached end of line
++		*p = '\0';
++		return count;
++	}
++	
++	p++; 
++	count++; 
++  }
++  // no more characters to read
++  if (count > 0) 
++    *p = '\0';
++  return count;
++}
++
++
++int readConfigFile(struct Conf *conf){
++	
++  char *line = (char *)malloc(BUF_LEN);
++  char *val = 0;
++  int n = 0;
++  
++  // open configuration file
++  int conf_file;
++  if ((conf_file = open("ass2_conf.txt", 'r')) < 0){
++    printf(2, "Failed opening file\n");
++    return -1;  
++  }
++  while((n = readline(conf_file, line, BUF_LEN)) > 0){
++    val = strchr(line, '=');
++    if (val == 0){
++	printf(2, "illigal configuration\n");
++	return -1;
++    }
++    *val = '\0'; // separate var and val
++    val++;
++    if(strcmp(line, "students_initial") == 0){
++      conf->students_initial = atoi(val);
++    }
++    else if(strcmp(line, "students_joining") == 0){
++      conf->students_joining = atoi(val);
++    }
++    else if(strcmp(line, "num_of_seats") == 0){
++      conf->num_of_seats = atoi(val);
++      conf->food_buffers[3] = 0; // initial size of table buffer
++    }
++    else if(strcmp(line, "salad_buffer_size") == 0){
++      conf->food_buffers[0] = atoi(val);
++    }
++    else if(strcmp(line, "pasta_buffer_size") == 0){
++      conf->food_buffers[1] = atoi(val);
++    }
++    else if(strcmp(line, "steak_buffer_size") == 0){
++      conf->food_buffers[2] = atoi(val);
++    }
++    else{
++      printf(2, "illigal configuration\n");
++      return -1;  
++    }//end else
++    
++  }//end while
++  //free(line);
++  close(conf_file);
++//   printf(1, "students_initial %d\n", conf->students_initial);
++//   printf(1, "students_joining %d\n", conf->students_joining);
++//   printf(1, "num_of_seats %d\n", conf->num_of_seats);
++//   printf(1, "salad_buffer_size %d\n", conf->food_buffers[0]);
++//   printf(1, "pasta_buffer_size %d\n", conf->food_buffers[1]);
++//   printf(1, "steak_buffer_size %d\n", conf->food_buffers[2]);
++//   printf(1, "table_buffer_size %d\n", conf->food_buffers[3]);
++  return 0;
++}//end readConfigFile
++
++
++///////////////////////////////////////////////// host ///////////////////////////////////////////////////////////////
++void student();
++int create_kthread(void (*start_func)(), uint stack_size);
++void increase_buffer(struct BufferState *buff_state, int max_counter, int food_type);
++void decrease_buffer(struct BufferState *buff_state, int max_counter, int stud_id, int food_type);
++
++void initiate_dining_threads(){
++	int i;
++	for(i = 0; i < MAX_THREADS; i++){
++		dining_threads[i] = -1;
++	}
++}
++
++// add with no repetitions
++void add_dining_thread(int tid){
++	int i = 0;
++	//printf(1, "adding thread %d\n", tid);
++	// while taken and not found
++	while((i < MAX_THREADS) && (dining_threads[i] > -1) && (dining_threads[i] != tid)){
++// 		printf(2, "dining_threads[i] = %d\n", dining_threads[i]);
++		i++;
++	}
++	if(i == MAX_THREADS){
++		printf(2, "Reached Max Num Of Threads!\n");
++		kthread_exit();
++	}
++	if((i < MAX_THREADS) && (dining_threads[i] == -1)){
++		dining_threads[i] = tid;
++// 		printf(1, "added thread %d in place %d\n", tid, i);
++	}
++	// else already in dining_threads 
++}
++// create initial students
++void open_table(int students_initial){
++	int i;
++	int tid;
++	
++	for(i = 0; i < students_initial; i++){
++		increase_buffer(&buffers[TABLE], conf->num_of_seats, -1);
++		//printf(1, "buffer table counter = %d\n", buffers[TABLE].counter);
++		tid = create_kthread(&student, STACK_SIZE);
++		add_dining_thread(tid);
++	}
++	
++}
++
++//wait for all dining threads to finish
++void close_table(){
++	int i = 0;
++	while(i < MAX_THREADS && dining_threads[i] > -1){
++		//printf(1, "host joining thread %d in place %d\n",dining_threads[i], i); 
++		kthread_join(dining_threads[i]);
++		i++;
++	}
++	//printf(1, "=== All students left ===\n");
++	// tell waiters to stop working
++	//printf(1, "In close_table acquiring mutex %d\n", running_mutex);
++	kthread_mutex_lock(running_mutex);
++	running = 0;
++	//printf(1, "In close_table releasing mutex %d\n", running_mutex);
++	kthread_mutex_unlock(running_mutex);
++	// wake up waiters
++	for(i = 0; i < 3; i++){
++		if(kthread_mutex_lock(buffers[i].mutex) < 0){
++			printf(2, "Host Failed Locking Mutex No. %d\n",buffers[i].mutex);
++			kthread_exit();
++		}
++		buffers[i].counter = 0;
++		if(kthread_cond_signal(buffers[i].full) < 0){
++			printf(2, "Host Failed Singnal Cond No. %d\n",buffers[i].full);
++			kthread_exit();
++		}
++		if(kthread_mutex_unlock(buffers[i].mutex) < 0){
++			printf(2, "Host Failed Unocking Mutex No. %d\n",buffers[i].mutex);
++			kthread_exit();
++		}
++	}
++}
++
++void printStatistics(){
++	int totalElapsedTime = 0;
++	int totalRunTime = 0;
++	int totalWaitTime = 0;
++	int ret = 0;
++	float avgRunTime = 0.0;
++	float avgWaitTime = 0.0;
++	int tid = kthread_id();
++	ret = retrieve_process_statistics(&totalElapsedTime, &totalRunTime, &totalWaitTime);
++	if(ret < 0){
++		printf(2, "Failed receive statistics for thread %d.\n", tid);
++		kthread_exit();
++	}
++	avgRunTime = totalRunTime / totalElapsedTime;
++	avgWaitTime = totalWaitTime / totalElapsedTime;
++	
++	// update global variables
++	kthread_mutex_lock(stats_mutex);
++	klt_rtime_sum += totalRunTime;
++	klt_wtime_sum += totalWaitTime;
++	kthread_mutex_unlock(stats_mutex);
++	
++	kthread_mutex_lock(output_mutex);
++	//printf(1, "Thread %d: totalElapsedTime %d, totalRunTime %d, totalWaitTime %d.\n", tid, totalElapsedTime, totalRunTime, totalWaitTime);
++	kthread_mutex_unlock(output_mutex);
++}
++
++ 
++void host(){
++	int host_num_of_seats = conf->num_of_seats;
++	int host_students_initial = conf->students_initial;
++	int host_students_joining = conf->students_joining;
++	int i;
++	int tid = 0;
++	
++	host_students_initial= (host_num_of_seats < host_students_initial ? host_num_of_seats : host_students_initial);
++	host_students_joining += (conf->students_initial - host_students_initial); 
++	
++	initiate_dining_threads();
++	// open table for initial students
++	open_table(host_students_initial);
++	
++	for(i = 0; i < host_students_joining; i++){
++		increase_buffer(&buffers[TABLE], host_num_of_seats, -1);
++		tid = create_kthread(&student, STACK_SIZE);
++		add_dining_thread(tid);
++	}
++	// wait for students to clear the table
++	close_table();
++	printStatistics();
++	kthread_exit();
++}
++
++/////////////////////////////////////////////////////// student /////////////////////////////////////////////////////////////
++void acquire_food_log(int stud_id, int food_type){
++	//printf(1, "In acquire_food_log acquiring mutex %d\n", output_mutex);
++	kthread_mutex_lock(output_mutex);
++	printf(logfile, "Student%d acquired %d.\n", stud_id, food_type);
++	//printf(1, "In acquire_food_log releasing mutex %d\n", output_mutex);
++	kthread_mutex_unlock(output_mutex);
++}
++
++void short_eating_process_log(int stud_id){
++	kthread_mutex_lock(output_mutex);
++	printf(logfile, "Student%d started short eating process.\n", stud_id);
++	kthread_mutex_unlock(output_mutex);
++}
++
++void long_eating_process_log(int stud_id){
++	kthread_mutex_lock(output_mutex);
++	printf(logfile, "Student%d started long eating process.\n", stud_id);
++	kthread_mutex_unlock(output_mutex);
++}
++
++
++void join_table_log(int stud_id){
++	kthread_mutex_lock(output_mutex);
++	printf(logfile, "Student%d joined the table.\n", stud_id);
++	kthread_mutex_unlock(output_mutex);
++}
++
++void leave_table_log(int stud_id){
++	kthread_mutex_lock(output_mutex);
++	printf(logfile, "Student%d left the table.\n", stud_id);
++	kthread_mutex_unlock(output_mutex);
++}
++
++
++
++void eating_process(int iter_num){
++	int i, j, t, k;
++	for(i = 1; i <= iter_num ; i++){
++		for(j = 1; j <= 1000; j++){
++			t = 1;
++			for(k = 1; k <= 20; k++){
++				t *= k;
++			}
++		}
++	}
++}
++
++void long_eating_process(int stud_id){
++	long_eating_process_log(stud_id);
++	eating_process(10000);//TODO
++}
++
++void short_eating_process(int stud_id){
++	short_eating_process_log(stud_id);
++	eating_process(100);//TODO
++}
++
++void acquire_food(FoodType food_type, int stud_id){
++	decrease_buffer(&buffers[food_type], conf->food_buffers[food_type], 
++					stud_id, (int)food_type);
++}
++
++void student(){
++	// Eating meals
++	int stud_id = kthread_id();
++	int food_type = stud_id % 3;
++	join_table_log(stud_id);
++	acquire_food(food_type, stud_id);
++	//acquire_food_log(stud_id, food_type);
++	food_type = (stud_id + 1) % 3;
++	acquire_food(food_type, stud_id);
++	//acquire_food_log(stud_id, food_type);
++	long_eating_process(stud_id);
++	food_type = (stud_id + 2) % 3;
++	acquire_food(food_type, stud_id);
++	//acquire_food_log(stud_id, food_type);
++	short_eating_process(stud_id);
++// 	printf(1, "table counter= %d\n", buffers[TABLE].counter);
++	//Clearing table's seat
++	decrease_buffer(&buffers[TABLE], conf->num_of_seats, -1, 0); // stud_id = -1 so that woun't print log message
++	leave_table_log(stud_id);
++	printStatistics();
++	kthread_exit();
++}
++
++///////////////////////////////////////////// waiters ////////////////////////////////////////////////////
++void fill_buffer_log(int food_type, int num_of_items, int buffer_size){
++	kthread_mutex_lock(output_mutex);
++	printf(logfile, "Waiter%d increased his buffer to %d/%d\n", 
++				food_type, num_of_items, buffer_size);
++	kthread_mutex_unlock(output_mutex);
++}
++
++void fill_food(FoodType food_type){
++	increase_buffer(&buffers[food_type], conf->food_buffers[food_type],(int)food_type);
++}
++
++void salad_waiter(){
++	
++	while(1){
++		kthread_mutex_lock(running_mutex);
++// 		printf(1, "Salad Waiter Acquired Lock No. %d\n", running_mutex);
++		if (!running) {
++			kthread_mutex_unlock(running_mutex);
++			printStatistics();
++			kthread_exit();
++		}
++		kthread_mutex_unlock(running_mutex);
++		fill_food(SALAD);
++	}
++}
++
++void pasta_waiter(){
++	
++	while(1){
++		kthread_mutex_lock(running_mutex);
++		if (!running) {
++			kthread_mutex_unlock(running_mutex);
++			printStatistics();
++			kthread_exit();
++		}
++		kthread_mutex_unlock(running_mutex);
++		fill_food(PASTA);
++	}
++}
++
++void steak_waiter(){
++	
++	while(1){
++		kthread_mutex_lock(running_mutex);
++		if (!running) {
++			kthread_mutex_unlock(running_mutex);
++			printStatistics();
++			kthread_exit();
++		}
++		kthread_mutex_unlock(running_mutex);
++		fill_food(STEAK);
++	}
++}
++
++///////////////////////////////////////////////////////// simulator /////////////////////////////////////////////////////////////
++
++void acquire_block_log(int stud_id, int food_type){
++	kthread_mutex_lock(output_mutex);
++ 	printf(logfile, "Student%d waits for %d.\n", stud_id, food_type);
++	kthread_mutex_unlock(output_mutex);
++}
++
++void allocate_resources(){
++  conf = (struct Conf *)malloc(sizeof(struct Conf));
++  
++  if(conf <= 0){
++	printf(2, "Failed Allocate Conf.\n");
++	exit();
++  }
++//   printf(1, "before reading file.\n");
++  if(readConfigFile(conf) < 0){
++    printf(2, "Failed reading configuration file\n");
++    exit();
++  }
++//   printf(1, "after reading file.\n");
++  // Initislizing buffer states for foodTypes and Seats
++  int i;
++  for(i = 0; i < LOCKS_NUM; i++){
++	  if((buffers[i].empty = kthread_cond_alloc()) < 0){
++		  printf(2, "Failed Allocate Empty Cond No. %d\n", i);
++		  exit();
++	  }
++	  
++	  if((buffers[i].full = kthread_cond_alloc()) < 0){
++		  printf(2, "Failed Allocate Full Cond No. %d\n", i);
++		  exit();
++	  }
++	  if((buffers[i].mutex = kthread_mutex_alloc()) < 0){
++		  printf(2, "Failed Allocate Mutex No. %d\n", i);
++		  exit();
++	  }
++// 	  printf(1, "mutex %d is of buffer %d.\n", buffers[i].mutex, i);
++	  buffers[i].counter = conf->food_buffers[i];
++// 	  printf(1, "BufferState %d: full %d, empty %d, mutex %d, counter %d\n", i, buffers[i].full, buffers[i].empty, buffers[i].mutex, buffers[i].counter);
++  }
++  // open/create log file
++  if((logfile = open("ass2_log.txt", O_CREATE | O_RDWR)) < 0){
++	printf(2, "Failed Open Logfile Mutex.\n");
++	exit(); 
++  }
++  
++  if((output_mutex = kthread_mutex_alloc()) < 0){
++	printf(2, "Failed Allocate Logfile Mutex.\n");
++	exit();
++  }
++//   printf(1, "mutex %d is of output stream.\n", output_mutex);
++  if((running_mutex = kthread_mutex_alloc()) < 0){
++	printf(2, "Failed Allocate Running Mutex.\n");
++	exit();
++  }  
++  if((stats_mutex = kthread_mutex_alloc()) < 0){
++	printf(2, "Failed Allocate Statistics Mutex.\n");
++	exit();
++  }  
++//   printf(1, "mutex %d is of running variable.\n", running_mutex);
++}
++
++void deallocate_resources(){
++	
++	close(logfile);
++	// dealloc mutex
++	kthread_mutex_dealloc(stats_mutex);
++	kthread_mutex_dealloc(running_mutex);
++	kthread_mutex_dealloc(output_mutex);
++ 	// printf(1, "=== DEALLOC ===\n");
++	int i;
++	for(i = 0; i < LOCKS_NUM; i++){
++		kthread_mutex_dealloc(buffers[i].mutex);
++		kthread_cond_dealloc(buffers[i].full);
++		kthread_cond_dealloc(buffers[i].full);
++	}
++	
++	free(conf);	
++}
++
++// receive state of the buffer to increase, max size of this buffer
++// and food_type if called by fill_food.
++// if not called by fill_food, food_type = -1
++void increase_buffer(struct BufferState *buff_state, int max_counter, int food_type){
++	int new_count = 0;
++	//printf(1, "Thread %d is in increase_buffer acquiring mutex %d\n", kthread_id(), buff_state->mutex);
++	//printf(1, "BufferState: full %d, empty %d, mutex %d, counter %d\n", buff_state->full, buff_state->empty, buff_state->mutex, buff_state->counter);
++	if(kthread_mutex_lock(buff_state->mutex) < 0){
++		printf(2, "Failed locking mutex %d!.\n", buff_state->mutex);
++		kthread_exit();
++	}
++	while (buff_state->counter == max_counter){
++		//printf(1, "Thread %d wait on cond %d\n", kthread_id(), buff_state->full);
++		kthread_cond_wait(buff_state->full, buff_state->mutex);
++	}
++	buff_state->counter++;
++	new_count = buff_state->counter;
++	if(food_type > -1){
++		// this function called by waiter of food_type
++		if(kthread_mutex_lock(running_mutex) < 0){
++			printf(2, "Failed locking mutex %d!.\n", running_mutex);
++			kthread_exit();
++		}
++		if(running){
++			// print log message
++			fill_buffer_log(food_type, new_count, max_counter);
++		}
++		if(kthread_mutex_unlock(running_mutex) < 0){
++			printf(2, "Failed unlocking mutex %d!.\n", running_mutex);
++			kthread_exit();
++		}
++	}
++	if (buff_state->counter == 1){
++		
++		kthread_cond_signal(buff_state->empty);
++		//printf(1, "DONE!\n");
++	}
++	//printf(1, "BufferState: full %d, empty %d, mutex %d, counter %d\n", buff_state->full, buff_state->empty, buff_state->mutex, buff_state->counter);
++	//printf(1, "Thread %d is in increase_buffer releasing mutex %d\n", kthread_id(), buff_state->mutex);
++	if(kthread_mutex_unlock(buff_state->mutex)< 0){
++		printf(2, "Failed unlocking mutex %d!.\n", buff_state->mutex);
++		kthread_exit();
++	}
++}
++
++// receive state of the buffer to decrease, max size of this buffer, student id if this called by acquire_food 
++// and food_type to acquire by the student.
++// if not called by acquire_food, stud_id = -1
++void decrease_buffer(struct BufferState *buff_state, int max_counter, int stud_id, int food_type)
++{
++	//printf(1, "Thread %d is in decrease_buffer acquiring mutex %d\n", kthread_id(), buff_state->mutex);
++	//printf(1, "BufferState: full %d, empty %d, mutex %d, counter %d\n", buff_state->full, buff_state->empty, buff_state->mutex, buff_state->counter);
++	int new_count = 0;
++	if(kthread_mutex_lock(buff_state->mutex)< 0){
++		printf(2, "Failed locking mutex %d!.\n", buff_state->mutex);
++		kthread_exit();
++	}
++	while (buff_state->counter == 0){
++// 		printf(1,"buff_state->counter == 0\n");
++		if(stud_id > -1)
++			acquire_block_log(stud_id, food_type); 
++		kthread_cond_wait(buff_state->empty, buff_state->mutex);
++	}
++	buff_state->counter--;
++// 	printf(1, "Thread %d did --\n", kthread_id());
++	new_count = buff_state->counter;
++	if(stud_id > -1){
++		acquire_food_log(stud_id, food_type);
++	}
++	if (buff_state->counter == (max_counter - 1)){
++// 		printf(1,"buff_state->counter == (max_counter - 1)\n");
++		kthread_cond_signal(buff_state->full);
++	}
++	//printf(1, "BufferState: full %d, empty %d, mutex %d, counter %d\n", buff_state->full, buff_state->empty, buff_state->mutex, buff_state->counter);
++	//printf(1, "Thread %d is in decrease_buffer releasing mutex %d\n", kthread_id(), buff_state->mutex);
++	if(kthread_mutex_unlock(buff_state->mutex) < 0) {
++		printf(2, "Failed unlocking mutex %d!.\n", buff_state->mutex);
++		kthread_exit();
++	}
++	//printf(1, "Thread %d done decrease_buffer\n", kthread_id());
++}
++
++
++void* alloc_thread_stack(int size){
++	void *stack = 0;
++	if((stack = malloc(size)) <= 0){
++		printf(2, "Failed Allocate Stack.\n");
++		exit();
++	}
++	return stack;
++}
++
++int create_kthread(void (*start_func)(), uint stack_size){
++	int tid;
++	void *stack = alloc_thread_stack(stack_size);
++	tid = kthread_create(start_func, stack, stack_size);
++	if(tid < 0){
++		printf(2, "Failed Creating Kthread.\n");
++		exit();
++	}
++	return tid;
++}
++
++void printSimulationStats(){
++	// this is the only running thread left
++	// no need in synching
++	int total_rtime = uptime() - start_time; // simulation total run time
++	// number of klt in simulation: 1 host, 3 waiters and students
++	int klt_num = 4 + conf->students_initial + conf->students_joining;
++	int avg_rtime = klt_rtime_sum / klt_num;
++	int avg_wtime = klt_wtime_sum / klt_num;
++	printf(logfile, "Simulation: Kernel-Level-Threads\n");
++	printf(logfile, "Total run time is: %d\n", total_rtime);
++	printf(logfile, "Average run time per kernel-level-thread is: %d\n", avg_rtime);
++	printf(logfile, "Average wait time per kernel-level-thread is: %d\n", avg_wtime);
++}
++
++void start_simulation(){
++	int tids[4];
++	
++	allocate_resources();
++	start_time = uptime(); // syscall
++// 	printf(1, "after resource allocation\n");
++	//create waiters
++	tids[0] = create_kthread(salad_waiter, STACK_SIZE);
++// 	printf(1, "Salad Waiter's Tid is %d\n", tids[0]);
++	tids[1] = create_kthread(pasta_waiter, STACK_SIZE);
++// 	printf(1, "Pasta Waiter's Tid is %d\n", tids[1]);
++	tids[2] = create_kthread(steak_waiter, STACK_SIZE);
++// 	printf(1, "Steak Waiter's Tid is %d\n", tids[2]);
++	//create host
++	tids[3] = create_kthread(host, STACK_SIZE);
++// 	printf(1, "Host's Tid is %d\n", tids[3]);
++	//join
++	int i;
++	for(i = 0; i < 4; i++){
++		kthread_join(tids[i]);
++// 		printf(1, "Simulator joined thread %d\n", tids[i]);
++	}
++// 	printf(1, "HAPPY HAPPY EVERYBODY JOIN!\n");
++	printSimulationStats();
++	deallocate_resources();
++}
++
++/////////////////////////////////////////////////////////// main /////////////////////////////////////////////////////////////////////////////////
++
++int main(){
++	start_simulation();
++	exit();
++	return 0;
++}
++
++
++
+Index: rs.h
+===================================================================
+--- rs.h	(revision 0)
++++ rs.h	(revision 0)
+@@ -0,0 +1,34 @@
++#define BUF_LEN 100
++#define NEWLINE '\n'
++
++#define STACK_SIZE 4000
++#define TABLE 3
++#define LOCKS_NUM 4
++#define MAX_THREADS 64
++
++struct BufferState{
++  int empty;
++  int full;
++  int mutex;
++  int counter;
++};
++
++
++typedef enum{
++  SALAD,
++  PASTA,
++  STEAK
++} FoodType;
++
++
++
++struct Conf{
++  int students_initial;
++  int students_joining;
++  int num_of_seats;
++  int food_buffers[4];
++};
++
++// void initiate_dining_threads();
++
++
+Index: ult_rs.c
+===================================================================
+--- ult_rs.c	(revision 0)
++++ ult_rs.c	(revision 0)
+@@ -0,0 +1,436 @@
++/*********************************************
++ * Simulation: User-Level-Thread
++ *********************************************/
++#include "types.h"
++#include "user.h"
++#include "fcntl.h"
++#include "rs.h"
++#include "uthread.h"
++
++#define STUD_PRIORITY 1
++#define HOST_PRIORITY 1
++#define WAITER_PRIORITY 1
++
++#define PRIO 1
++
++// global variables
++int logfile; // file descriptor
++struct BufferState buffers[LOCKS_NUM];
++// list of thread id of student's thread
++// only host access this 
++int running = 1;
++struct Conf *conf;
++int readConfigFile(struct Conf *conf);
++void student();
++
++/********************************************************
++ * Read Configuration File
++ * *****************************************************/
++
++int readline(int fd, char *buf, int max){
++  char *p = buf;
++  int n = 0;
++  int count = 0;
++
++  while((count < max) && ((n = read(fd, p, 1)) > 0)){
++	
++	if(*p == NEWLINE){ // reached end of line
++		*p = '\0';
++		return count;
++	}
++	
++	p++; 
++	count++; 
++  }
++  // no more characters to read
++  if (count > 0) 
++    *p = '\0';
++  return count;
++}
++
++
++int readConfigFile(struct Conf *conf){
++	
++  char *line = (char *)malloc(BUF_LEN);
++  char *val = 0;
++  int n = 0;
++  
++  // open configuration file
++  int conf_file;
++  if ((conf_file = open("ass2_conf.txt", 'r')) < 0){
++    printf(2, "Failed opening file\n");
++    return -1;  
++  }
++  while((n = readline(conf_file, line, BUF_LEN)) > 0){
++    val = strchr(line, '=');
++    if (val == 0){
++	printf(2, "illigal configuration\n");
++	return -1;
++    }
++    *val = '\0'; // separate var and val
++    val++;
++    if(strcmp(line, "students_initial") == 0){
++      conf->students_initial = atoi(val);
++    }
++    else if(strcmp(line, "students_joining") == 0){
++      conf->students_joining = atoi(val);
++    }
++    else if(strcmp(line, "num_of_seats") == 0){
++      conf->num_of_seats = atoi(val);
++      conf->food_buffers[3] = 0; // initial size of table buffer
++    }
++    else if(strcmp(line, "salad_buffer_size") == 0){
++      conf->food_buffers[0] = atoi(val);
++    }
++    else if(strcmp(line, "pasta_buffer_size") == 0){
++      conf->food_buffers[1] = atoi(val);
++    }
++    else if(strcmp(line, "steak_buffer_size") == 0){
++      conf->food_buffers[2] = atoi(val);
++    }
++    else{
++      printf(2, "illigal configuration\n");
++      return -1;  
++    }//end else
++    
++  }//end while
++  //free(line);
++  close(conf_file);
++//   printf(1, "students_initial %d\n", conf->students_initial);
++//   printf(1, "students_joining %d\n", conf->students_joining);
++//   printf(1, "num_of_seats %d\n", conf->num_of_seats);
++//   printf(1, "salad_buffer_size %d\n", conf->food_buffers[0]);
++//   printf(1, "pasta_buffer_size %d\n", conf->food_buffers[1]);
++//   printf(1, "steak_buffer_size %d\n", conf->food_buffers[2]);
++//   printf(1, "table_buffer_size %d\n", conf->food_buffers[3]);
++  return 0;
++}//end readConfigFile
++
++
++/*********************************************************
++ * Host
++ * ******************************************************/
++void open_table(int students_initial);
++void add_student_joining(int students_joining, int num_of_seats);
++void close_table();
++
++void host(){
++	int host_num_of_seats = conf->num_of_seats;
++	int host_students_initial = conf->students_initial;
++	int host_students_joining = conf->students_joining;
++	host_students_initial= (host_num_of_seats < host_students_initial ? host_num_of_seats : host_students_initial);
++	host_students_joining += (conf->students_initial- host_students_initial); 
++	// open table for initial students
++	open_table(host_students_initial);
++	add_student_joining(host_students_joining, host_num_of_seats);
++	close_table();
++	uthread_exit();
++}
++
++// students_initial < num_of_seats
++void open_table(int students_initial){
++	int i;
++	int res_val;
++	
++	for(i = 0; i < students_initial; i++){
++		// walk student to table
++		buffers[TABLE].counter++;
++		if((res_val = uthread_create(student, STUD_PRIORITY)) < 0){
++			printf(2, "Host Failed Create uthread.\n");
++			exit();
++		}
++		//printf(1, "Host created uthread %d\n", res_val);
++	}
++}
++
++void add_student_joining(int students_joining, int num_of_seats){
++	int i;
++	int first_time = 1;
++	
++	for(i = 0; i < students_joining; i++){
++		while(buffers[TABLE].counter == num_of_seats){
++			// decrease priority
++			if(PRIO && first_time){
++				if(uthread_setpr(HOST_PRIORITY + 1) < 0){
++					printf(2, "Host Failed Setting Priority.\n");
++					exit();
++				}
++				first_time = 0;
++			}
++			
++			// give up cpu
++			uthread_yield();
++		}
++		if(PRIO && uthread_setpr(HOST_PRIORITY) < 0){
++			printf(2, "Host Failed Setting Priority.\n");
++			exit();
++		}
++		// can add student
++		buffers[TABLE].counter++;
++		printf(1, "");
++		if(uthread_create(student, STUD_PRIORITY) < 0){
++			printf(2, "Host Failed Create uthread.\n");
++			exit();
++		}
++		
++	}
++}
++
++void close_table(){
++	int first_time = 1;
++	// wait for students to leave table
++	while(buffers[TABLE].counter > 0){
++		if(PRIO && first_time){
++			if(uthread_setpr(HOST_PRIORITY + 1) < 0){
++				printf(2, "Host Failed Setting Priority.\n");
++				exit();
++			}
++			first_time = 0;
++		}
++		// give up cpu
++		uthread_yield();
++	}
++	// set back priority
++	if(PRIO && uthread_setpr(HOST_PRIORITY) < 0){
++		printf(2, "Host Failed Setting Priority.\n");
++		exit();
++	}
++	// notify waiters to close 
++	running = 0;
++}
++
++
++/********************************************************
++ * Simulator
++ * *****************************************************/
++void salad_waiter();
++void pasta_waiter();
++void steak_waiter();
++
++void allocate_resources(){
++	int i;
++	conf = (struct Conf *)malloc(sizeof(struct Conf));
++	if(conf <= 0){
++		printf(2, "Failed Allocate Conf.\n");
++		exit();
++	}
++	if(readConfigFile(conf) < 0){
++		printf(2, "Failed reading configuration file\n");
++		exit();
++	}
++	for(i = 0; i < LOCKS_NUM; i++){
++		buffers[i].empty = -1; // not used this program
++		buffers[i].full = -1;
++		buffers[i].counter = conf->food_buffers[i];
++	}
++	if((logfile = open("ass2_log.txt", O_CREATE | O_RDWR)) < 0){
++		printf(2, "Failed Open Logfile Mutex.\n");
++		exit(); 
++	}
++}
++
++void deallocate_resources(){
++	close(logfile);
++	free(conf);
++}
++
++void simulation(){
++	int res_val = 0;
++	//printf(1, "In simulation\n");
++	allocate_resources();
++	//printf(1, "In simulation, after allocate_resources\n");
++	if((res_val = uthread_create(host, HOST_PRIORITY)) < 0){
++		printf(2, "Main Failed Create Host uthread.\n");
++		exit();
++	}
++	//printf(1, "host start func %d\n", student);
++	if((res_val = uthread_create(salad_waiter, WAITER_PRIORITY)) < 0){
++		printf(2, "Main Failed Create Waiter uthread.\n");
++		exit();
++	}
++	if((res_val = uthread_create(pasta_waiter, WAITER_PRIORITY)) < 0){
++		printf(2, "Main Failed Create Waiter uthread.\n");
++		exit();
++	}
++	if((res_val = uthread_create(steak_waiter, WAITER_PRIORITY)) < 0){
++		printf(2, "Main Failed Create Waiter uthread.\n");
++		exit();
++	}
++	//printf(1, "In simulation,  before start_all\n");
++	if((res_val = uthread_start_all()) < 0){
++		printf(2, "Main Failed Start All.\n");
++		exit();
++	}
++	//printf(1, "In simulation, after start_all\n");
++	// will not reached
++}
++
++/*********************************************************************
++ * Student
++ * *******************************************************************/
++
++void acquire_food_log(int stud_id, int food_type){
++	printf(logfile, "Student%d acquired %d.\n", stud_id, food_type);
++}
++
++void short_eating_process_log(int stud_id){
++	printf(logfile, "Student%d started short eating process.\n", stud_id);
++}
++
++void long_eating_process_log(int stud_id){
++	printf(logfile, "Student%d started long eating process.\n", stud_id);
++}
++
++
++void join_table_log(int stud_id){
++	printf(logfile, "Student%d joined the table.\n", stud_id);
++}
++
++void leave_table_log(int stud_id){
++	printf(logfile, "Student%d left the table.\n", stud_id);
++}
++
++void acquire_block_log(int stud_id, int food_type){
++ 	printf(logfile, "Student%d waits for %d.\n", stud_id, food_type);
++}
++
++// student stud_id try to acquire food of food_type
++void acquire_food(int food_type, int stud_id){
++	int first_time = 1;
++	while(buffers[food_type].counter == 0){
++		acquire_block_log(stud_id, food_type);
++		if(PRIO && first_time){
++			if(uthread_setpr(STUD_PRIORITY + 1) < 0){
++				printf(2, "Host Failed Setting Priority.\n");
++				exit();
++			}
++			first_time = 0;
++		}
++		printf(1, "");
++		// give up cpu
++		uthread_yield();
++	}
++	// get back prior priority
++	if(PRIO && uthread_setpr(STUD_PRIORITY) < 0){
++		printf(2, "Student Failed Setting Priority.\n");
++		exit();
++	}
++	// buffer is not empty
++	buffers[food_type].counter--;
++	acquire_food_log(stud_id, food_type);
++}
++
++void eating_process(int iter_num){
++	int i, j, t, k;
++	for(i = 1; i <= iter_num ; i++){
++		for(j = 1; j <= 1000; j++){
++			t = 1;
++			for(k = 1; k <= 20; k++){
++				t *= k;
++			}
++		}
++	}
++}
++
++void long_eating_process(int stud_id){
++	long_eating_process_log(stud_id);
++	eating_process(10000);//TODO
++}
++
++void short_eating_process(int stud_id){
++	short_eating_process_log(stud_id);
++	eating_process(100);//TODO
++}
++
++void student(){
++	int stud_id = uthread_self().tid;
++	int food_type = stud_id % 3;
++	join_table_log(stud_id);
++	acquire_food(food_type, stud_id);
++	food_type = (stud_id + 1) % 3;
++	acquire_food(food_type, stud_id);
++	long_eating_process(stud_id);
++	food_type = (stud_id + 2) % 3;
++	acquire_food(food_type, stud_id);
++	short_eating_process(stud_id);
++	//Clearing table's seat
++	buffers[TABLE].counter--;
++	leave_table_log(stud_id);
++	uthread_exit();
++}
++
++/*********************************************************************
++ * Waiter
++ * *********************************************************************/
++
++void fill_buffer_log(int food_type, int num_of_items, int buffer_size){
++	printf(logfile, "Waiter%d increased his buffer to %d/%d\n", 
++				food_type, num_of_items, buffer_size);
++}
++
++void general_waiter(FoodType food_type){
++	int first_time;
++	int max_buffer_size = conf->food_buffers[food_type];
++	int new_count = 0;
++	// started in low priority by the simulator
++	
++	if(PRIO && uthread_setpr(WAITER_PRIORITY) < 0){
++		printf(2, "Waiter Failed Setting Priority.\n");
++		exit();
++	}
++	
++	while(running){
++		first_time = 1;
++		while(running && buffers[food_type].counter == conf->food_buffers[food_type]){
++			// low priority
++			if(PRIO && first_time){
++				if(uthread_setpr(WAITER_PRIORITY + 1) < 0){
++					printf(2, "Host Failed Setting Priority.\n");
++					exit();
++				}
++				first_time = 0;
++			}
++			// wait for buffer to get empty
++			uthread_yield();
++		}
++		// game over
++		if(!running){
++			uthread_exit();
++		}
++		// get back priority
++		if(PRIO && uthread_setpr(WAITER_PRIORITY) < 0){
++			printf(2, "Waiter Failed Setting Priority.\n");
++			exit();
++		}
++		// fill buffer
++		new_count = ++buffers[food_type].counter;
++		fill_buffer_log(food_type, new_count, max_buffer_size);
++		uthread_yield();
++		
++	}
++	uthread_exit();
++}
++
++void salad_waiter(){
++	general_waiter(SALAD);
++}
++
++void pasta_waiter(){
++	general_waiter(PASTA);
++}
++void steak_waiter(){
++	general_waiter(STEAK);
++}
++
++/****************************************************************************
++ * Main
++ * **************************************************************************/
++
++int main(){
++	simulation();
++	exit(); // not reached
++}
++
++
++
++
+Index: types.h
+===================================================================
+--- types.h	(revision 2)
++++ types.h	(working copy)
+@@ -1,4 +1,7 @@
++
+ typedef unsigned int   uint;
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
++typedef unsigned long  ulong;
+ typedef uint pde_t;
++
+Index: syscall.c
+===================================================================
+--- syscall.c	(revision 2)
++++ syscall.c	(working copy)
+@@ -98,6 +98,19 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_kthread_create(void);
++extern int sys_kthread_id(void);
++extern int sys_kthread_exit(void);
++extern int sys_kthread_join(void);
++extern int sys_kthread_mutex_alloc(void);
++extern int sys_kthread_mutex_dealloc(void);
++extern int sys_kthread_mutex_lock(void);
++extern int sys_kthread_mutex_unlock(void);
++extern int sys_kthread_cond_alloc(void);
++extern int sys_kthread_cond_dealloc(void);
++extern int sys_kthread_cond_wait(void);
++extern int sys_kthread_cond_signal(void);
++extern int sys_retrieve_process_statistics(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -121,6 +134,19 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_kthread_create]   sys_kthread_create,
++[SYS_kthread_id]   sys_kthread_id,
++[SYS_kthread_exit]   sys_kthread_exit,
++[SYS_kthread_join]   sys_kthread_join,
++[SYS_kthread_mutex_alloc]   sys_kthread_mutex_alloc,
++[SYS_kthread_mutex_dealloc]   sys_kthread_mutex_dealloc,
++[SYS_kthread_mutex_lock]   sys_kthread_mutex_lock,
++[SYS_kthread_mutex_unlock]   sys_kthread_mutex_unlock,
++[SYS_kthread_cond_alloc]   sys_kthread_cond_alloc,
++[SYS_kthread_cond_dealloc]   sys_kthread_cond_dealloc,
++[SYS_kthread_cond_wait]   sys_kthread_cond_wait,
++[SYS_kthread_cond_signal]   sys_kthread_cond_signal,
++[SYS_retrieve_process_statistics] sys_retrieve_process_statistics,
+ };
+ 
+ void
+Index: syscall.h
+===================================================================
+--- syscall.h	(revision 2)
++++ syscall.h	(working copy)
+@@ -21,3 +21,20 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++
++#define SYS_kthread_create  22
++#define SYS_kthread_id  23
++#define SYS_kthread_join  24
++#define SYS_kthread_exit  25
++
++#define SYS_kthread_mutex_alloc  26
++#define SYS_kthread_mutex_dealloc  27
++#define SYS_kthread_mutex_lock  28
++#define SYS_kthread_mutex_unlock  29
++
++#define SYS_kthread_cond_alloc  30
++#define SYS_kthread_cond_dealloc  31
++#define SYS_kthread_cond_wait  32
++#define SYS_kthread_cond_signal  33
++
++#define SYS_retrieve_process_statistics 34
+\ No newline at end of file
+Index: spinlock.c
+===================================================================
+--- spinlock.c	(revision 2)
++++ spinlock.c	(working copy)
+@@ -25,8 +25,10 @@
+ acquire(struct spinlock *lk)
+ {
+   pushcli(); // disable interrupts to avoid deadlock.
+-  if(holding(lk))
++  if(holding(lk)) {
++    cprintf("lock name: %s\n", lk->name); 
+     panic("acquire");
++  }
+ 
+   // The xchg is atomic.
+   // It also serializes, so that reads after acquire are not
+@@ -43,8 +45,10 @@
+ void
+ release(struct spinlock *lk)
+ {
+-  if(!holding(lk))
++  if(!holding(lk)) {
++    cprintf("lock name: %s\n", lk->name); 
+     panic("release");
++  }
+ 
+   lk->pcs[0] = 0;
+   lk->cpu = 0;
+Index: usys.S
+===================================================================
+--- usys.S	(revision 2)
++++ usys.S	(working copy)
+@@ -29,3 +29,16 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(kthread_create)
++SYSCALL(kthread_id)
++SYSCALL(kthread_exit)
++SYSCALL(kthread_join)
++SYSCALL(kthread_mutex_alloc)
++SYSCALL(kthread_mutex_dealloc)
++SYSCALL(kthread_mutex_lock)
++SYSCALL(kthread_mutex_unlock)
++SYSCALL(kthread_cond_alloc)
++SYSCALL(kthread_cond_dealloc)
++SYSCALL(kthread_cond_wait)
++SYSCALL(kthread_cond_signal)
++SYSCALL(retrieve_process_statistics)
+\ No newline at end of file
+Index: kthread.h
+===================================================================
+--- kthread.h	(revision 2)
++++ kthread.h	(working copy)
+@@ -1,4 +1,6 @@
+-#dfeine MAX_STACK_SIZE 4000
++//#include "types.h"
++
++#define MAX_STACK_SIZE 4000
+ #define MAX_MUTEXES 64
+ #define MAX_CONDS 64
+ 
+@@ -6,7 +8,7 @@
+ 	The API of the KLT package
+  ********************************/
+ 
+-int kthread_create( void*(*start_func)(), void* stack, unit stack_size ); 
++int kthread_create( void(*start_func)(), void* stack, uint stack_size ); 
+ int kthread_id();
+ void kthread_exit();
+ int kthread_join( int thread_id );
+Index: uthread.c
+===================================================================
+--- uthread.c	(revision 0)
++++ uthread.c	(revision 0)
+@@ -0,0 +1,320 @@
++#include "types.h"
++#include "uthread.h"
++#include "user.h"
++
++// The thread pool
++static uthread_t pool[MAX_UTHREADS];
++// linked list of threads' indices in pool ordered according to priority
++static uthread_pool *pool_index = 0;
++// number of uthread created
++int uthread_counter = 0;
++// counter for tid
++int tidCounter = 1;
++// next available place in pool, uthreads are not erased of pool 
++// thus pool_size increase with every create and never decreased 
++int pool_size = 0; 
++// the running uthread
++static uthread_t *current = 0;
++// index link of current in pool_index
++static uthread_pool *current_index = 0;
++
++uthread_pool* get_pool_index(int index){
++	uthread_pool* iter = 0;
++	if(!pool_index){// empty list
++		printf(2, "uthread: index not in index list.\n");
++		exit();
++	}
++	iter = pool_index;
++	while(iter && (iter->index != index)){
++		iter = iter->next;
++	}
++	if(!iter){//not found
++		printf(2, "uthread: index not in index list.\n");
++		exit();
++	}
++	return iter;
++}
++
++// A function that wraps the entry functipn of a thread.
++// This is just a suggestion, feel free to modify it as needed.
++void wrap_function(void (*entry)()) {
++  //printf(1, "uthread %d in wrap_function calls: %d\n", current->tid, current->start_func);
++  entry();
++  uthread_exit();
++}
++
++//for debugging
++void print_pool(){
++  uthread_pool* tmp = pool_index;
++  while(tmp){
++	  printf(1, "pool[%d] = %d\n", tmp->index, pool[tmp->index].tid);
++	  tmp = tmp->next;
++  }
++}
++
++void add_index(uthread_pool* thread_index, int priority){
++  uthread_pool *temp = 0;
++  if(DEBUG_UTHREAD){
++	printf(1, "add uthread %d\n", pool[thread_index->index].tid);
++  }
++  if(!pool_index) {
++    pool_index = thread_index;
++  } else {
++    if(priority < pool[pool_index->index].priority){
++      //insert as head
++      thread_index->next = pool_index;
++      pool_index = thread_index;
++    } else {// pool[pool_index->next].priority <= priority
++      temp = pool_index;
++      while(temp->next && (priority >= pool[temp->next->index].priority)){
++        temp = temp->next;
++      }
++      thread_index->next = temp->next;
++      temp->next = thread_index;
++    }
++  }
++}
++
++// Creates a thread, adds a new thread to the thread pool.
++int uthread_create(void (*start_func)(), int priority) {
++  // Create a thread.
++  
++  uthread_t thread;
++  uthread_pool *thread_index;
++  thread.tid = tidCounter; // Counter is next available tid
++  thread.index = pool_size;
++  // Allocate uthread's stack
++  thread.stack = malloc(1000);
++  thread.ss_sp = thread.stack;
++  
++  thread.ss_size = (size_t)1000;
++  thread.priority = priority;
++  thread.EBP = thread.ss_sp;
++  
++  thread.start_func = start_func;
++  thread.first_run = 1;
++  pool[pool_size] = thread;
++  thread_index = (uthread_pool *)malloc(sizeof(uthread_pool));
++  thread_index->next = 0;
++  thread_index->index = pool_size;
++  
++  
++  // insert by priority
++  add_index(thread_index, thread.priority);
++  // Increase counter of uthreads
++  uthread_counter++;
++  tidCounter++;
++  pool_size++;
++  if(DEBUG_UTHREAD){
++	  printf(1, "In create, created uthread %d, start_func %d\n", thread.tid, thread.start_func);
++  }
++   //print_pool();
++  // return uthread's id
++  return thread.tid;
++}
++// current_index >= 0
++int pick_next_thread(int current_index) {
++  //uthread_pool *temp = pool_index;
++  //uthread_pool *head = pool_index;
++    #ifdef SCHED_PB
++      // priority
++      if(DEBUG_UTHREAD){
++	printf(1, "Priority sched\n");
++      }
++      // is there lower priority? yes - it's in head of linked list
++      if(pool[pool_index->index].priority == pool[current_index].priority){ //lowest priority
++	if((current_index == pool_size - 1) || (pool[current_index+1].priority > pool[current_index].priority)){
++		// current is last in pool or last in same lowest priority - round robin
++		return pool_index->index; // might be current
++	}
++	// not last in same priority
++	return (current_index+1);
++      }else {// not lowest priority - return lowest
++	return pool_index->index;
++      }
++    #else
++	// round robin
++	// print_pool();
++	//printf(1, "RR sched\n");
++      if(current_index == pool_size - 1){// start new round
++	//printf(1, "RR sched, return head\n");
++	return pool_index->index;
++      }
++      //printf(1, "RR sched, return t %d\n", pool[current_index->next->index].tid);
++      return (current_index+1);
++    #endif
++//     // Return the next thread
++//     if(pool_index != temp) {
++//       pool_index = pool_index->next;
++//       head->next = temp->next;
++//       temp->next = head;
++//       return &pool[pool_index->index];
++//     }
++}
++
++// Passes the control to another thread.
++void uthread_yield_with(uthread_pool* next_index) {
++  uthread_t *thread = 0;
++  uthread_pool* thread_index = 0;
++  if(!next_index){
++    thread_index = get_pool_index(pick_next_thread(current_index->index)); // index of next // called from yield only
++    //printf(1, "Picked next\n");
++  }else{
++    thread_index = next_index; // called from exit only
++  }
++  thread = &pool[thread_index->index];
++  if(DEBUG_UTHREAD){
++	printf(1, "next to run: %d\n", thread->tid);
++  }
++  if(current != thread) {
++    STORE_ESP(current->ss_sp);
++    STORE_EBP(current->EBP);
++    current = thread;
++    current_index = thread_index;
++    // if thread called uthread_yield, just return
++    // else call wrap_function
++    if (current->first_run){
++      current->first_run = 0;
++      LOAD_ESP(current->ss_sp);
++      LOAD_EBP(current->EBP);
++      PUSH(current->start_func);
++      CALL(wrap_function); // Argument allready in stack
++    } else {
++      LOAD_ESP(current->ss_sp);
++      LOAD_EBP(current->EBP);
++    }
++  }
++}
++
++void uthread_yield() {
++  uthread_yield_with(0); // pass null pointer
++}
++
++// void free_uthread_index(){
++//   uthread_pool *temp;
++//   temp = pool_index;
++//   pool_index = pool_index->next;
++//   free(temp);
++// }
++
++// remove current_index from pool_index
++void remove_index(){
++  uthread_pool* temp = 0;
++  if(DEBUG_UTHREAD){
++	printf(1, "remove uthread %d from list\n", current->tid);
++  }
++  if(current_index == pool_index){// first in list 
++    pool_index = pool_index->next;
++  }else {// search for current_index link
++    temp = pool_index;// != current_index
++    while(temp->next && temp->next != current_index){
++      temp = temp->next;
++    } 
++    if(!temp->next){// current_index not in list
++      printf(2, "current_index not found!\n");
++      exit();
++    }
++    // temp->next == current_index != 0
++    temp->next = temp->next->next;
++  }
++  if(DEBUG_UTHREAD){
++	print_pool();
++  }	  
++}
++
++// Stops the thread, and remove it from the pool.
++void uthread_exit() {
++  // get current out of pool_index
++  //int i = current_index->index;
++  //printf(1, "uthread %d in exit\n", current->tid);
++  uthread_pool* next_to_run = get_pool_index(pick_next_thread(current_index->index)); // does not changes current
++  remove_index();
++  // current_index not in linked list
++  //free(current_index); //release link's memory
++  //free(pool[i].stack); // release current's stack memory
++  uthread_counter--; // reduce num of uthreads 
++  // free the index from the linked list
++  if(!uthread_counter) { // game over
++    exit();
++  }
++  uthread_yield_with(next_to_run);
++}
++
++// Activates a thread from the pool.
++// executed only once.
++int uthread_start_all() {
++  static int first_call = 1;
++  //printf(1, "In start all\n");
++      //printf(1, "first call: %d\n", first_call);
++  // first_call == 0 if this was not called for the first time. 
++  if (!first_call){
++    printf(2, "\'uthread_start_all\' can be called only once.\n");
++    return -1;
++  }
++  first_call = 0;
++  
++  // if no uthread in pool return -1 (error)
++  if(!uthread_counter){
++    printf(2, "No uThreads to run.\n");
++    return -1;
++  }
++  current_index = pool_index; // index of thread with lowest priority
++  current = &pool[pool_index->index]; 
++  current->first_run = 0;
++  //printf(1, "first to run: %d\n", current->tid);
++  LOAD_ESP(current->ss_sp);
++  LOAD_EBP(current->EBP);
++  // first time running
++  PUSH(current->start_func);
++  CALL(wrap_function); // Argument allready in stack
++  // will not get here again because wraped with exit
++  return -1;
++}
++// changes uthread's index  link spot in list
++void change_index(int priority) {
++  // if new priority equal to previous- stay in place
++  // if new priority lower than previous - pull out of list and insert
++  if(priority != current->priority){
++    // pull out
++    remove_index();
++    //printf(1, "after remove uthread %d\n", current->tid);
++    //print_pool();
++    add_index(current_index, priority);
++    //printf(1, "after add uthread %d\n", current->tid);
++    //print_pool();
++  }
++//   if(priority > current->priority && pool_index->next) {
++//     uthread_pool *temp = current_index;
++//     uthread_pool *temp2;
++//     while((temp->next) && (pool[temp->next->index].priority < priority)) {
++//       temp = temp->next;
++//     }
++//   
++//     temp2 = temp->next;
++//     temp->next = pool_index;
++//     pool_index = pool_index->next;
++//     temp->next->next = temp2;
++//   }
++}
++
++// Sets a thread pirority, and returns the previous one.
++int uthread_setpr(int priority) {
++  int prev_pr = current->priority;
++  if(DEBUG_UTHREAD){
++	printf(1, "uthread %d in setpr from %d to %d\n", current->tid, current->priority, priority);
++  }
++  change_index(priority);
++  current->priority = priority;
++  //print_pool();
++  return prev_pr;
++}
++
++// Gets a thread pirority.
++int uthread_getpr() {
++  return current->priority;
++}
++
++// Returns the thread control block.
++uthread_t uthread_self() {
++  return *current;
++}
+\ No newline at end of file
+Index: uthread.h
+===================================================================
+--- uthread.h	(revision 2)
++++ uthread.h	(working copy)
+@@ -1,3 +1,4 @@
++typedef int size_t;
+ 
+ /********************************
+ 	Macors which inline assembly
+@@ -4,47 +5,65 @@
+  ********************************/
+  
+ // Saves the value of esp to var
+-#define STORE_ESP(var) 	asm("movl %%esp, %0;" : "=r" ( var ))
++#define STORE_ESP(var)	asm("movl %%esp, %0;" : "=r" ( var ))
+ 
+ // Loads the contents of var into esp
+ #define LOAD_ESP(var) 	asm("movl %0, %%esp;" : : "r" ( var ))
++ 
++// Saves the value of ebp to var
++#define STORE_EBP(var)	asm("movl %%ebp, %0;" : "=r" ( var ))
+ 
++// Loads the contents of var into ebp
++#define LOAD_EBP(var) 	asm("movl %0, %%ebp;" : : "r" ( var ))
++
+ // Calls the function func
+-#define CALL(addr)		asm("call *%0;" : : "r" ( addr ))
++#define CALL(addr)	asm("call *%0;" : : "r" ( addr ))
+ 
+ // Pushes the contents of var to the stack
+-#define PUSH(var)		asm("movl %0, %%edi; push %%edi;" : : "r" ( var ))
++#define PUSH(var)	asm("movl %0, %%edi; push %%edi;" : : "r" ( var ))
+ 
+-
+-
++// Max uthreads.
+ #define MAX_UTHREADS 64
++#define DEBUG_UTHREAD 0
+ 
+ // Represents a ULT. 
+ // Feel free to extend this definition as needed.
+ typedef struct
+ {
+-	int tid;				// A unique thread ID within the process
+-	void *ss_sp;		// Stack base or pointer
+-	size_t ss_size;	// Stack size
+-	int priority;		// The priority of the thread 0…9 (0 is highest)
++  int tid;			// A unique thread ID within the process
++  int index;			// The threads index in the pool.
++  void *ss_sp;			// Stack pointer.
++  void *stack;			// Stack for free method
++  size_t ss_size;		// Stack size.
++  int priority;			// The priority of the thread 0-9 (0 is highest).
++  int first_run;		// An indicator for the first run.
++  void (*start_func)(); 	// The start function for this thread.
++  void *EBP;			// EBP.
+ } uthread_t;
+ 
+-// A function that wraps the entry functipn of a thread.
+-// This is just a siggestion, fell free to modify it as needed.
+-void wrap_function(void (*entry)())
++typedef struct uthread_pool
+ {
+-  entry();
+-  uthread_exit();
+-}
++  int useless_int;
++  struct uthread_pool *next;
++  int index;
++} uthread_pool;
+ 
+ /********************************
+ 	The API of the ULT package
+  ********************************/
+- 
++
++// Creates a thread, adds a new thread to the thread pool.
+ int uthread_create(void (*start_func)(), int priority);
++// Passes the control to another thread.
+ void uthread_yield();
++// Stops the thread, and remove it from the pool.
+ void uthread_exit();
++// Activates a thread from the pool.
+ int uthread_start_all();
++// Sets a thread pirority.
+ int uthread_setpr(int priority);
++// Gets a thread pirority.
+ int uthread_getpr();
+-uthread_t uthread_self();
+\ No newline at end of file
++// Returns the thread control block.
++uthread_t uthread_self();
++
+Index: sysproc.c
+===================================================================
+--- sysproc.c	(revision 2)
++++ sysproc.c	(working copy)
+@@ -5,6 +5,7 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "proc.h"
++#include "kthread.h"
+ 
+ int
+ sys_fork(void)
+@@ -82,9 +83,114 @@
+ sys_uptime(void)
+ {
+   uint xticks;
+-  
+   acquire(&tickslock);
+   xticks = ticks;
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_kthread_create(void)
++{
++  int start_func;
++  int stack;
++  int stack_size;
++  
++  if(argint(0, &start_func) < 0)
++    return -1;
++  if(argint(1, &stack) < 0)
++    return -1;
++  if(argint(2, &stack_size) < 0)
++    return -1;
++  
++  return kthread_create((void (*)())start_func, (void*)stack, (uint)stack_size);
++}
++
++int
++sys_kthread_id(void) {
++  return kthread_id();
++}
++
++int
++sys_kthread_exit(void) {
++  kthread_exit();
++  return 0;  // not reached
++}
++
++int
++sys_kthread_join(void) {
++  int thread_id;
++  
++  if(argint(0, &thread_id) < 0)
++    return -1;
++  
++  return kthread_join(thread_id);
++}
++
++int sys_kthread_mutex_alloc(void) {
++  return kthread_mutex_alloc();
++}
++
++int sys_kthread_mutex_dealloc(void) {
++  int mutex_id;
++  if(argint(0, &mutex_id) < 0)
++    return -1;
++  return kthread_mutex_dealloc(mutex_id);
++}
++
++int sys_kthread_mutex_lock(void) {
++  int mutex_id;
++  if(argint(0, &mutex_id) < 0)
++    return -1;
++  return kthread_mutex_lock(mutex_id);
++}
++
++int sys_kthread_mutex_unlock(void) {
++  int mutex_id;
++  if(argint(0, &mutex_id) < 0)
++    return -1;
++  return kthread_mutex_unlock(mutex_id);
++}
++
++int sys_kthread_cond_alloc(void) {
++  return kthread_cond_alloc();
++}
++
++int sys_kthread_cond_dealloc(void) {
++  int cond_id;
++  if(argint(0, &cond_id) < 0)
++    return -1;
++  return kthread_cond_dealloc(cond_id);
++}
++
++int sys_kthread_cond_wait(void) {
++  int mutex_id;
++  int cond_id;
++  if(argint(1, &mutex_id) < 0)
++    return -1;
++  if(argint(0, &cond_id) < 0)
++    return -1;
++  return kthread_cond_wait(cond_id, mutex_id);
++}
++
++int sys_kthread_cond_signal(void) {
++  int cond_id;
++  if(argint(0, &cond_id) < 0)
++    return -1;
++  return kthread_cond_signal(cond_id);
++}
++
++int sys_retrieve_process_statistics(void){
++  int totalElapsedTime;
++  int totalRunTime;
++  int totalWaitTime;
++  if(argint(0, &totalElapsedTime) < 0)
++    return -1;
++  if(argint(1, &totalRunTime) < 0)
++    return -1;
++  if(argint(2, &totalWaitTime) < 0)
++    return -1;
++  return retrieve_process_statistics((int*)totalElapsedTime,
++				     (int*)totalRunTime,
++				     (int*)totalWaitTime);
++}
+Index: proc.c
+===================================================================
+--- proc.c	(revision 2)
++++ proc.c	(working copy)
+@@ -6,17 +6,33 @@
+ #include "x86.h"
+ #include "proc.h"
+ #include "spinlock.h"
++#include "kthread.h"
+ 
++// Proccess Table
+ struct {
+   struct spinlock lock;
+   struct proc proc[NPROC];
+ } ptable;
+ 
++
++// Mutex Table
++struct {
++  struct spinlock lock;
++  struct kthread_mutex_t mutex[MAX_MUTEXES];
++} mutex_table;
++
++// Cond Table
++struct {
++  struct spinlock lock;
++  struct kthread_cond_t cond[MAX_CONDS];
++} cond_table;
++
+ static struct proc *initproc;
+ 
+ int nextpid = 1;
+ extern void forkret(void);
+ extern void trapret(void);
++extern int sys_uptime(void);
+ 
+ static void wakeup1(void *chan);
+ 
+@@ -24,6 +40,8 @@
+ pinit(void)
+ {
+   initlock(&ptable.lock, "ptable");
++  initlock(&mutex_table.lock, "mutex_table");
++  initlock(&cond_table.lock, "cond_table");
+ }
+ 
+ //PAGEBREAK: 32
+@@ -45,12 +63,21 @@
+   return 0;
+ 
+ found:
++  // update creation time
++  p->ctime = sys_uptime();
++  // init run time
++  p->rtime = 0;
++  // init end time
++  p->etime = 0;
++  // init last run time
++  p->lastRunTime = 0;
++
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+-  if((p->kstack = kalloc()) == 0){
++  if((p->kstack = kalloc()) == 0) {
+     p->state = UNUSED;
+     return 0;
+   }
+@@ -110,10 +137,10 @@
+   uint sz;
+   
+   sz = proc->sz;
+-  if(n > 0){
++  if(n > 0) {
+     if((sz = allocuvm(proc->pgdir, sz, sz + n)) == 0)
+       return -1;
+-  } else if(n < 0){
++  } else if(n < 0) {
+     if((sz = deallocuvm(proc->pgdir, sz, sz + n)) == 0)
+       return -1;
+   }
+@@ -136,7 +163,7 @@
+     return -1;
+ 
+   // Copy process state from p.
+-  if((np->pgdir = copyuvm(proc->pgdir, proc->sz)) == 0){
++  if((np->pgdir = copyuvm(proc->pgdir, proc->sz)) == 0) {
+     kfree(np->kstack);
+     np->kstack = 0;
+     np->state = UNUSED;
+@@ -145,6 +172,7 @@
+   np->sz = proc->sz;
+   np->parent = proc;
+   *np->tf = *proc->tf;
++  np->tid = 0;
+ 
+   // Clear %eax so that fork returns 0 in the child.
+   np->tf->eax = 0;
+@@ -168,13 +196,17 @@
+ {
+   struct proc *p;
+   int fd;
++  
++  if(proc->tid)
++    kthread_exit();
+ 
++
+   if(proc == initproc)
+     panic("init exiting");
+ 
+   // Close all open files.
+-  for(fd = 0; fd < NOFILE; fd++){
+-    if(proc->ofile[fd]){
++  for(fd = 0; fd < NOFILE; fd++) {
++    if(proc->ofile[fd]) {
+       fileclose(proc->ofile[fd]);
+       proc->ofile[fd] = 0;
+     }
+@@ -189,8 +221,8 @@
+   wakeup1(proc->parent);
+ 
+   // Pass abandoned children to init.
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-    if(p->parent == proc){
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++    if(p->parent == proc) {
+       p->parent = initproc;
+       if(p->state == ZOMBIE)
+         wakeup1(initproc);
+@@ -212,14 +244,14 @@
+   int havekids, pid;
+ 
+   acquire(&ptable.lock);
+-  for(;;){
++  for(;;) {
+     // Scan through table looking for zombie children.
+     havekids = 0;
+-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+       if(p->parent != proc)
+         continue;
+       havekids = 1;
+-      if(p->state == ZOMBIE){
++      if(p->state == ZOMBIE) {
+         // Found one.
+         pid = p->pid;
+         kfree(p->kstack);
+@@ -236,7 +268,7 @@
+     }
+ 
+     // No point waiting if we don't have any children.
+-    if(!havekids || proc->killed){
++    if(!havekids || proc->killed) {
+       release(&ptable.lock);
+       return -1;
+     }
+@@ -276,13 +308,13 @@
+ {
+   struct proc *p;
+ 
+-  for(;;){
++  for(;;) {
+     // Enable interrupts on this processor.
+     sti();
+ 
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
+-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+       if(p->state != RUNNABLE)
+         continue;
+ 
+@@ -292,6 +324,8 @@
+       proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
++      // save time received cpu time
++      p->lastRunTime = (sys_uptime() - p->ctime);
+       swtch(&cpu->scheduler, proc->context);
+       switchkvm();
+ 
+@@ -310,7 +344,6 @@
+ sched(void)
+ {
+   int intena;
+-
+   if(!holding(&ptable.lock))
+     panic("sched ptable.lock");
+   if(cpu->ncli != 1)
+@@ -320,7 +353,11 @@
+   if(readeflags()&FL_IF)
+     panic("sched interruptible");
+   intena = cpu->intena;
++  // update run time;
++  proc->rtime += (sys_uptime() - proc->ctime - proc->lastRunTime);
++  // switch to scheduler
+   swtch(&proc->context, cpu->scheduler);
++  // back from scheduler
+   cpu->intena = intena;
+ }
+ 
+@@ -371,7 +408,7 @@
+   // guaranteed that we won't miss any wakeup
+   // (wakeup runs with ptable.lock locked),
+   // so it's okay to release lk.
+-  if(lk != &ptable.lock){  //DOC: sleeplock0
++  if(lk != &ptable.lock) {  //DOC: sleeplock0
+     acquire(&ptable.lock);  //DOC: sleeplock1
+     release(lk);
+   }
+@@ -385,7 +422,7 @@
+   proc->chan = 0;
+ 
+   // Reacquire original lock.
+-  if(lk != &ptable.lock){  //DOC: sleeplock2
++  if(lk != &ptable.lock) {  //DOC: sleeplock2
+     release(&ptable.lock);
+     acquire(lk);
+   }
+@@ -422,8 +459,8 @@
+   struct proc *p;
+ 
+   acquire(&ptable.lock);
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-    if(p->pid == pid){
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++    if(p->pid == pid) {
+       p->killed = 1;
+       // Wake process from sleep if necessary.
+       if(p->state == SLEEPING)
+@@ -456,7 +493,7 @@
+   char *state;
+   uint pc[10];
+   
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+     if(p->state == UNUSED)
+       continue;
+     if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+@@ -464,7 +501,7 @@
+     else
+       state = "???";
+     cprintf("%d %s %s", p->pid, state, p->name);
+-    if(p->state == SLEEPING){
++    if(p->state == SLEEPING) {
+       getcallerpcs((uint*)p->context->ebp+2, pc);
+       for(i=0; i<10 && pc[i] != 0; i++)
+         cprintf(" %p", pc[i]);
+@@ -473,4 +510,358 @@
+   }
+ }
+ 
++/********************************
++     The API of the KLT package
++ ********************************/
+ 
++int kthread_create( void (*start_func)() ,void* stack, uint stack_size ) {
++  int i, pid;
++  struct proc *np;
++  
++  // Input check
++  if(stack_size < 0) {
++    cprintf("Stack size is too small.\n");
++    return -1;
++  }
++
++  // Allocate process.
++  if((np = allocproc()) == 0)
++    return -1;
++
++  np->pgdir = proc->pgdir; //set new thread mem image to be the same as its creator:
++  np->tid = 1; //thread id is same as process id (uniqe for each thread in system, 0 for processes)
++  proc->tid = 1;
++
++
++  np->sz = proc->sz;
++  np->parent = proc->parent; // All threads are brothers, YO BRO!
++  *np->tf = *proc->tf;
++  np->cwd = proc->cwd;
++
++  // Clear %eax so that fork returns 0 in the child.
++  np->tf->eax = 0;
++  np->tf->esp = (uint)stack + stack_size; //set thread's main function
++  np->tf->eip = (uint)*start_func; //set thread's main function
++
++  //copy all file descriptors (just int copy)
++  for(i = 0; i < NOFILE; i++)
++      np->ofile[i] = proc->ofile[i];
++
++  pid = np->pid;
++  np->state = RUNNABLE;
++  safestrcpy(np->name, proc->name, sizeof(proc->name));
++  return pid;
++}
++
++int kthread_id() {
++  return proc->pid;
++}
++
++// EXIT!
++void kthread_exit() {
++  struct proc *p;
++  int found = 0;
++  int fd = 0;
++  
++  acquire(&ptable.lock);	// ==== aquire ptable ====
++  
++  // Wakes up whoever sleeps on me.
++  wakeup1(proc);
++  
++  proc->state = ZOMBIE;
++  
++  // Search for more non zombie brothers
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++    if((p->parent == proc->parent) && (p->state != ZOMBIE)) {
++      found = 1;
++      break;
++    }
++  }
++  
++  
++  if(!found) {
++    for(fd = 0; fd < NOFILE; fd++){
++      if(proc->ofile[fd]){
++	fileclose(proc->ofile[fd]);
++	proc->ofile[fd] = 0;
++      }
++    }
++    
++    iput(proc->cwd);
++    proc->cwd = 0;
++
++    p = 0;
++    // For all zombie brother
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++      if((p->parent == proc->parent) && (p != proc)) {
++
++	kfree(p->kstack);
++	p->kstack = 0;
++	p->state = UNUSED;
++	p->pid = 0;
++	p->tid = 0;
++	p->parent = 0;
++	p->name[0] = 0;
++	p->killed = 0;
++      }
++    }
++    wakeup1(proc->parent);
++  }
++
++  // Jump into the scheduler, never to return.
++  
++  sched();	// ==== release ptable ====
++  panic("zombie exit");
++}
++
++int kthread_join(int thread_id) {
++  struct proc *p;
++  int foundone = 0;
++  
++  // Input check
++  if(thread_id < 0 || thread_id >= NPROC) {
++    cprintf("Thread ID out of range.\n");
++    return -1;
++  }
++  
++  acquire(&ptable.lock);
++  
++  for(;;) {
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++      if(p->pid == thread_id) {
++	foundone = 1;
++	break;
++      }
++    }
++    
++    if(!foundone) {
++      panic("Not a child of the process !\n");
++    }
++    
++    if(p->state == ZOMBIE) {
++      release(&ptable.lock);
++      return 0;
++    }
++    
++    p->joincounter++;
++    sleep(p, &ptable.lock);
++
++    release(&ptable.lock);
++    return 0;
++  }
++}
++
++// Allocates a mutex
++int kthread_mutex_alloc() {
++  int i, j;
++  acquire(&mutex_table.lock);
++  for(i = 0; i < MAX_MUTEXES; i++)
++    if(mutex_table.mutex[i].state == MUTEX_UNUSED)
++      goto mutex_found;
++  release(&mutex_table.lock);
++  return -1;
++
++mutex_found:
++  mutex_table.mutex[i].state = UNLOCKED;
++  for(j = 0; j < MAX_MUTEXES; j++)
++    mutex_table.mutex[i].queue[j] = 0;
++  mutex_table.mutex[i].queue_first = 0;
++  mutex_table.mutex[i].queue_last = 0;
++  mutex_table.mutex[i].holding = 0;
++  release(&mutex_table.lock);
++
++  return i;
++}
++
++// Deallocates a mutex
++int kthread_mutex_dealloc(int mutex_id) {
++  
++  // Input check
++  if(mutex_id < 0 || mutex_id >= MAX_MUTEXES) {
++    cprintf("Mutex ID out of range.\n");
++    return -1;
++  }
++  
++  acquire(&mutex_table.lock);
++  mutex_table.mutex[mutex_id].state = MUTEX_UNUSED;
++  release(&mutex_table.lock);
++  
++  return 0;
++}
++
++// Adds a thread to the mutex queue
++void add_to_mutex_queue(int mutex_id) {
++  mutex_table.mutex[mutex_id].queue[mutex_table.mutex[mutex_id].queue_last] = proc;
++  if(++mutex_table.mutex[mutex_id].queue_last == MAX_MUTEXES)
++    mutex_table.mutex[mutex_id].queue_last = 0;
++}
++
++// Removes a thread from the mutex queue, returns 0 if the queue is empty.
++int remove_from_mutex_queue(int mutex_id) {
++  mutex_table.mutex[mutex_id].holding = mutex_table.mutex[mutex_id].queue[mutex_table.mutex[mutex_id].queue_first];
++  mutex_table.mutex[mutex_id].queue[mutex_table.mutex[mutex_id].queue_first] = 0;
++  if(mutex_table.mutex[mutex_id].queue_first != mutex_table.mutex[mutex_id].queue_last)
++    if(++mutex_table.mutex[mutex_id].queue_first == MAX_MUTEXES)
++      mutex_table.mutex[mutex_id].queue_first = 0;
++  return mutex_table.mutex[mutex_id].holding == 0;
++}
++
++int kthread_mutex_lock(int mutex_id) {
++  
++  acquire(&mutex_table.lock);
++  
++  // Error! mutex not allocated.
++  if(mutex_table.mutex[mutex_id].state == MUTEX_UNUSED) {
++    cprintf("Error! mutex %d not allocated\n", mutex_id);
++    release(&mutex_table.lock);
++    return -1;
++  }
++  
++  // If unlocked, the current thread locks the mutex.
++  if(mutex_table.mutex[mutex_id].state == UNLOCKED) {
++//     cprintf("thread %d acquiring lock: %d\n",proc->pid, mutex_id);
++    mutex_table.mutex[mutex_id].holding = proc;
++    mutex_table.mutex[mutex_id].state = LOCKED;
++    release(&mutex_table.lock);
++  }
++  // If allready locked, the current thread sleeps until the mutex is unlocked.
++  else {
++//     cprintf("thread %d is trying to lock and sleeps on: %d\n",proc->pid, mutex_id); //4
++    add_to_mutex_queue(mutex_id);
++    acquire(&ptable.lock);
++//     cprintf("Thread %d is going to sleep ZZZzzz (lock).\n", proc->pid);
++    proc->state = SLEEPING;
++    release(&mutex_table.lock); // release here to avoid context switch before set to sleep
++    sched();
++    release(&ptable.lock);
++  }
++  return 0;
++}
++
++int kthread_mutex_unlock(int mutex_id) {
++  acquire(&mutex_table.lock);
++  
++  // Error! mutex not allocated.
++  if(mutex_table.mutex[mutex_id].state == MUTEX_UNUSED) {
++    cprintf("Error! mutex %d not allocated\n", mutex_id);
++    release(&mutex_table.lock);
++    return -1;
++  }
++  
++  // If locked, the current thread unlocks the mutex or passes the key.
++  if(mutex_table.mutex[mutex_id].state != LOCKED) {
++    cprintf("Error! Mutex %d is not even locked!\n", mutex_id);
++    release(&mutex_table.lock);
++    return -1;
++  }
++  
++  // If unlocked, this clearly is an error.
++  if(mutex_table.mutex[mutex_id].holding != proc) {
++    cprintf("Error! %d is not the same holder! %d\n", proc->pid, mutex_id);
++    release(&mutex_table.lock);
++    return -1;
++  }
++  
++//   cprintf("thread %d releasing lock: %d\n", proc->pid, mutex_id);
++  // If no other thread is waiting for the lock, the current thread unlocks the mutex.
++  if(remove_from_mutex_queue(mutex_id)) {
++    mutex_table.mutex[mutex_id].state = UNLOCKED;
++    release(&mutex_table.lock);
++  }
++  // If there are threads waiting for the mutex's lock, the current thread passes it to the first one on the queue.
++  else {
++//     cprintf("thread %d acquiring lock: %d\n",mutex_table.mutex[mutex_id].holding->pid, mutex_id);
++    
++    acquire(&ptable.lock);
++    mutex_table.mutex[mutex_id].holding->state = RUNNABLE; 
++    release(&ptable.lock);
++    release(&mutex_table.lock); 
++  }
++  return 0;
++}
++
++// Allocates a CV
++int kthread_cond_alloc() {
++  int i;
++  acquire(&cond_table.lock);
++  for(i = 0; i < MAX_CONDS; i++)
++    if(cond_table.cond[i].state == COND_UNUSED)
++      goto cond_found;
++  release(&cond_table.lock);
++  return -1;
++
++cond_found:
++  cond_table.cond[i].state = COND_USED;
++  
++  cond_table.cond[i].mutex = kthread_mutex_alloc();
++  release(&cond_table.lock);
++
++  return i;
++}
++
++// Dealocates a CV
++int kthread_cond_dealloc(int cond_id) {
++  
++  // Input check
++  if(cond_id < 0 || cond_id >= MAX_CONDS) {
++    cprintf("Cond ID out of range.\n");
++    return -1;
++  }
++  
++  acquire(&cond_table.lock);
++  if(cond_table.cond[cond_id].state != COND_UNUSED) {
++    cond_table.cond[cond_id].state = COND_UNUSED;
++    cond_table.cond[cond_id].mutex = -1;
++  }
++  release(&cond_table.lock);
++  
++  return 0;
++}
++
++// WAIIIIIIIIT YAY YAY YAY YAY YAY
++int kthread_cond_wait(int cond_id, int mutex_id) {
++  // Input check
++  if(cond_id < 0 || cond_id >= MAX_CONDS) {
++    cprintf("Cond ID out of range.\n");
++    return -1;
++  }
++  
++  if(kthread_mutex_unlock(mutex_id) < 0)
++    return -1;
++//   cprintf("Thread %d in cond wait released lock %d\n", proc->pid, mutex_id);
++  acquire(&cond_table.lock);
++//   cprintf("Thread %d is going to sleep ZZZzzz (cond wait).\n", proc->pid);
++  sleep(&cond_table.cond[cond_id], &cond_table.lock);
++  release(&cond_table.lock);
++  
++  if(kthread_mutex_lock(mutex_id) < 0)
++    return -1;
++  
++  return 0;
++}
++
++int kthread_cond_signal(int cond_id) {
++
++  // Input check
++  if(cond_id < 0 || cond_id >= MAX_CONDS) {
++    cprintf("Cond ID out of range.\n");
++    return -1;
++  }
++  
++  acquire(&cond_table.lock);
++  wakeup(&cond_table.cond[cond_id]);
++  release(&cond_table.lock);
++
++  return 0;
++}
++
++int retrieve_process_statistics( int* totalElapsedTime, 
++				 int* totalRunTime,
++				 int* totalWaitTime){
++  proc->etime = sys_uptime();
++  //cprintf("from proc.c: ctime = %d, rtime = %d, etime = %d.\n", proc->ctime, proc->rtime, proc->etime); 
++  (*totalElapsedTime) = (proc->etime - proc->ctime);
++  (*totalRunTime) = proc->rtime;
++  (*totalWaitTime) = ((*totalElapsedTime) - proc->rtime);	
++  return 0;
++}
+Index: proc.h
+===================================================================
+--- proc.h	(revision 2)
++++ proc.h	(working copy)
+@@ -1,5 +1,6 @@
+ // Segments in proc->gdt.
+-#define NSEGS     7
++#define NSEGS 7
++#define MAX_MUTEXES 64
+ 
+ // Per-CPU state
+ struct cpu {
+@@ -7,7 +8,7 @@
+   struct context *scheduler;   // swtch() here to enter scheduler
+   struct taskstate ts;         // Used by x86 to find stack for interrupt
+   struct segdesc gdt[NSEGS];   // x86 global descriptor table
+-  volatile uint started;        // Has the CPU started?
++  volatile uint started;       // Has the CPU started?
+   int ncli;                    // Depth of pushcli nesting.
+   int intena;                  // Were interrupts enabled before pushcli?
+   
+@@ -60,6 +61,8 @@
+   char *kstack;                // Bottom of kernel stack for this process
+   enum procstate state;        // Process state
+   volatile int pid;            // Process ID
++  volatile int tid;            // Thread ID
++  int joincounter;
+   struct proc *parent;         // Parent process
+   struct trapframe *tf;        // Trap frame for current syscall
+   struct context *context;     // swtch() here to run process
+@@ -68,6 +71,12 @@
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  
++  // performance measures
++  int ctime;			// creation time
++  int etime;			// end time
++  int rtime;			// runing time
++  int lastRunTime;		// last time proc received cpu time
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+@@ -75,3 +84,24 @@
+ //   original data and bss
+ //   fixed-size stack
+ //   expandable heap
++
++
++// Mutex typedef
++enum mutex_state { MUTEX_UNUSED, UNLOCKED, LOCKED };
++
++struct kthread_mutex_t {
++  enum mutex_state state;		// The state of the mutex
++  struct proc *holding;			// The process who's holding the mutex
++  struct proc *queue[MAX_MUTEXES];	// The waiting to acquire queue
++  int queue_first;			// The first index of the waiting queue
++  int queue_last;			// The last index of the waiting queue
++};
++
++// CV typedef
++enum cond_state { COND_UNUSED, COND_USED };
++
++struct kthread_cond_t {
++  enum cond_state state;		// The state of the CV
++  int mutex;			// The ID of the mutex
++};
++
+Index: defs.h
+===================================================================
+--- defs.h	(revision 2)
++++ defs.h	(working copy)
+@@ -116,7 +116,10 @@
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int retrieve_process_statistics( int* totalElapsedTime, int* totalRunTime,
++int* totalWaitTime);
+ 
++
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
+Index: ulib.c
+===================================================================
+--- ulib.c	(revision 2)
++++ ulib.c	(working copy)
+@@ -3,6 +3,7 @@
+ #include "fcntl.h"
+ #include "user.h"
+ #include "x86.h"
++#define ITOA_BASE 10
+ 
+ char*
+ strcpy(char *s, char *t)
+@@ -103,3 +104,36 @@
+     *dst++ = *src++;
+   return vdst;
+ }
++
++char*
++itoa(int xx, char* buff)
++{
++  static char digits[] = "0123456789ABCDEF";
++  char tmp_buf[16];
++  int i, neg, j;
++  uint x;
++
++  neg = 0;
++  if(xx < 0){
++    neg = 1;
++    x = -xx;
++  } else {
++    x = xx;
++  }
++
++  i = 0;
++  do{
++    tmp_buf[i++] = digits[x % ITOA_BASE];
++  }while((x /= ITOA_BASE) != 0);
++  if(neg)
++    tmp_buf[i++] = '-';
++  
++  j = 0;
++  while(--i >= 0)
++    buff[j++] = tmp_buf[i];
++  buff[j] = '\0';
++  return buff;
++}
++
++
++

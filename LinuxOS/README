@@ -1,0 +1,7 @@
+These .patch files contain code additions to the source code of a basic Unix-like Operating System called Xv6, written by MIT for teaching purposes.
+(For more information on Xv6 see: http://pdos.csail.mit.edu/6.828/2012/xv6.html)
+As implied by the patches names, each patch adds functionality to a different part of the Operating System:
+- signals.patch - Add signals "communication" between processes and signal handling.
+- threads_synch.patch - Implement "Threads" (processes that share common memory space, and more) and synchronization (semaphore, spin lock).
+- mem_manage.patch - Memory Management - Swapping memory block using various methods, managing Heap/Stack/User spaces.
+- filesystems.patch - Implementation of inode and frame structures, different types of files (regular, directory, link), and the connection between them.     
