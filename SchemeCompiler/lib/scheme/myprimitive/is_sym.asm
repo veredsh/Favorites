@@ -1,0 +1,28 @@
+/* is_sym.asm  
+ *check if argument is SYM and return #t otherwise return #f
+ */
+ 
+ IS_SYM:
+	PUSH(FP);
+	MOV(FP,SP);		/*OPEN NEW FRAME*/
+	PUSH(R1);
+	MOV(R0,SOB_FALSE);  /*DEFOLT THE ANS IS FALSE */
+	MOV(R1,FPARG(1)); /*SAVE THE ARGUMENTS NUMBER TO R1*/
+	CMP(R1,IMM(1));   /*NEED TO BE ONLY 1 ARGUMENT*/
+	JUMP_EQ(CHECK_IF_SYM);
+	SHOW("bad input argument for IS_SYM? need to be one argument. R1 is the num of arguments",R1);
+	HALT;
+ CHECK_IF_SYM:
+	CMP(IND(FPARG(2)),T_SYMBOL); /*CHECK THE ONLY ARGUMENT IF IT T_SYMBOL IF NOT JUMP IF YES ANS=#T*/
+	JUMP_NE(CHECK_IF_GEN);
+	MOV(R0,SOB_TRUE);  /*IF I GET HERE SO I CHECK AND THE ANS IS #T */
+	JUMP(EXIT_SYM);
+ CHECK_IF_GEN:
+	CMP(IND(FPARG(2)), T_GENSYM);
+	JUMP_NE(EXIT_SYM);
+	MOV(R0, SOB_TRUE);
+ EXIT_SYM:
+	POP(R1);
+	MOV(SP,FP);
+	POP(FP);
+ RETURN; 

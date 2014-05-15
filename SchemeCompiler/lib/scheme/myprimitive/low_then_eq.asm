@@ -1,0 +1,50 @@
+/* low_then_eq.asm  
+ *low\eq between N numbers: X1<=X2<= ... <=Xn return #t or #f
+ *args = 1 or more 
+ *special (<= 5) -> #t
+ */
+ 
+ LOWTHENEQ:
+ 
+	PUSH(FP);
+	MOV(FP,SP);		/*OPEN NEW FRAME*/
+	PUSH(R1);
+	PUSH(R2);
+	PUSH(R3)
+	MOV(R1,IMM(2)); /* R1<-2 TO BE COUNTER UP UNTIL FPARG(1)*/
+	
+	CMP(FPARG(1),IMM(0));
+	JUMP_GT(LOW_THEN_EQ_LOOP);
+	SHOW("bad input argument for <= need to be one or more arguments. R1 is the num of arguments",R1);
+	HALT;
+ LOW_THEN_EQ_LOOP:
+	CMP(R1,FPARG(1)); /*BECAUSE R2 GET ALREADY THE FGPARG(2) */
+	JUMP_GT(LOW_THEN_EQ_LOOP_END);
+	MOV(R2,FPARG(R1)); /*save the first argument to R2*/
+	MOV(R3,FPARG(R1+1)); /*save the SECOND argument to R3*/
+	CMP(IND(R2),T_INTEGER); /*CHECK IF THE ARGUMENT IN R2  IS INTEGER*/
+	JUMP_EQ(CHECK_OTHER_NUM_LOW_THEN_EQ);
+	SHOW("The argumen in the R2  is not integer. print R2",IND(R2));
+	HALT;
+ CHECK_OTHER_NUM_LOW_THEN_EQ:	
+	CMP(IND(R3),T_INTEGER); /*CHECK IF THE ARGUMENT IN R3  IS INTEGER*/
+	JUMP_EQ(ARG_IS_OK_LOW_THEN_EQ);
+	SHOW("The argumen in the R3  is not integer. print R3",IND(R3));
+	HALT;
+ ARG_IS_OK_LOW_THEN_EQ:	
+	CMP(INDD(R2,1),INDD(R3,1)); /*COMPERE THE FIRST ARG VALUE WITH THE NEXT ONE NEED TO BE LOWER OR EQUAL*/
+	JUMP_GT(ANS_FALSE_LOW_THEN_EQ);
+	INCR(R1);
+	JUMP(LOW_THEN_EQ_LOOP);
+ LOW_THEN_EQ_LOOP_END:
+	MOV(R0,IMM(5)); /*THE LOOP IS ENDED END ALL ARGS ARE FIT TO THE CONDITION NEED TO RETURN #t*/
+	JUMP(END_LOW_THEN_EQ);
+ ANS_FALSE_LOW_THEN_EQ:
+	MOV(R0,IMM(3)); /*IF I GET HERE SO I NEED TO RETURN #f IMM(3)=FALSE*/
+ END_LOW_THEN_EQ:	
+	POP(R3);
+	POP(R2);
+	POP(R1);
+	MOV(SP,FP);
+	POP(FP);
+ RETURN; 

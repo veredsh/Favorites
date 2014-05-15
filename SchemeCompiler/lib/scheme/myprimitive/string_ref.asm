@@ -1,0 +1,51 @@
+/* string_ref.asm
+ * RECIVE pointer to a SOB_STRING, and returns the n'th char of it
+
+ */
+
+ STRING_REF:
+	  PUSH(FP);
+	  MOV(FP, SP);
+
+	  PUSH(R1);
+	  PUSH(R2);
+	  CMP(FPARG(1),IMM(2)); /*NEED TO BE 2 ARGUMENT FOR THIS PROCEDURE*/
+	  JUMP_EQ(ANOTHER_CHECK_REF);
+	  SHOW("bad input argument for STRING_REF need to be TWO  arguments. PRINT->",FPARG(1));
+	  HALT;
+ ANOTHER_CHECK_REF:
+	  MOV(R1, FPARG(2)); /*R1<- THE STRING*/
+	  MOV(R2, FPARG(3)); /*R2<- THE NUM */
+	  CMP(IND(R1),T_STRING); /*CHECK IF ITS SOB_STRING*/
+	  JUMP_EQ(ANOTHER_CHECK_2_REF);
+	  SHOW("bad input THE FIRST ARGUMENT IS NOT A STRING. PRINT->",IND(R1));
+	  HALT;
+ ANOTHER_CHECK_2_REF:
+	  CMP(IND(R2),T_INTEGER); /*CHECK IF ITS SOB_INTEGER*/
+	  JUMP_EQ(ANOTHER_CHECK_3_REF);
+	  SHOW("bad input THE SECOND ARGUMENT IS NOT SOB_INTEGER). PRINT->",IND(R2));
+	  HALT;
+ ANOTHER_CHECK_3_REF:	
+	  CMP(INDD(R2,1),IMM(0)); /*CHECK IF the number  is <0 */
+	  JUMP_GE(ANOTHER_CHECK_4_REF);
+	  SHOW("bad input THE SECOND ARGUMENT NEED TO BE >0 . PRINT->",INDD(R2,1));
+	  HALT;
+ ANOTHER_CHECK_4_REF:
+	  CMP(INDD(R2,1),INDD(R1,1)); /*CHECK IF the number  is < string length*/
+	  JUMP_LT(ANOTHER_CHECK_5_REF);
+	  SHOW("bad input THE SECOND ARGUMENT NEED TO BE  < (length string). PRINT->",INDD(R2,1));
+	  HALT;
+ ANOTHER_CHECK_5_REF:	  
+	  ADD(R1, IMM(2));
+	  ADD(R1, INDD(R2, 1));
+	  MOV(R0, IND(R1));
+	  PUSH(R0);
+	  CALL(MAKE_SOB_CHAR);
+	  DROP(1);
+	  POP(R2);
+	  POP(R1);
+	  MOV(SP, FP);
+	  POP(FP);
+ RETURN;
+
+

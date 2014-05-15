@@ -1,0 +1,45 @@
+ /* lib/scheme/myprimitive/is_eq.asm
+  * receive two pointers and return T_BOOL in R0.
+  */
+ 
+  IS_EQ:
+	PUSH(FP);
+	MOV(FP, SP);
+	PUSH(R1);
+	PUSH(R2);
+	PUSH(R3);
+	MOV(R1, FPARG(2)); /* FIRST ARGUMENT */
+	MOV(R2, FPARG(3)); /* SECOND ARGUMENT */
+	MOV(R3, IND(R1));
+	CMP(R3, IND(R2));
+	JUMP_NE(NOT_EQ);
+	CMP(R3, T_VOID);
+	JUMP_EQ(COMPARE_ADD);
+	CMP(R3, T_NIL);
+	JUMP_EQ(COMPARE_ADD);
+	CMP(R3, T_STRING);
+	JUMP_EQ(COMPARE_ADD);
+	CMP(R3, T_VECTOR);
+	JUMP_EQ(COMPARE_ADD);
+	CMP(R3, T_PAIR);
+	JUMP_EQ(COMPARE_ADD);
+  COMPARE_VAL:
+	 /* compare numbers, chars, symbols, booleans */
+	MOV(R3, INDD(R1, 1)); /* COMPARE VALUE */
+	CMP(R3, INDD(R2, 1));
+	JUMP_NE(NOT_EQ);
+	MOV(R0, IMM(SOB_TRUE)); /* TRUE */
+	JUMP(IS_EQ_END);
+  COMPARE_ADD:
+	CMP(R1, R2); /* COMPARE ADDRESSES */
+	JUMP_NE(NOT_EQ);
+	MOV(R0, IMM(SOB_TRUE)); /* TRUE */
+	JUMP(IS_EQ_END);
+  NOT_EQ:
+    MOV(R0, IMM(SOB_FALSE)); /* FALSE */
+  IS_EQ_END:
+	POP(R3);
+	POP(R2);
+	POP(R1);
+	POP(FP);
+	RETURN;

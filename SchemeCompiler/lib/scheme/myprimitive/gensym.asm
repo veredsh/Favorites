@@ -1,0 +1,71 @@
+ /* lib/scheme/myprimitive/gensym.asm
+  * no args, put in R0 T_GENSYM object
+  */
+  
+  GENSYM:
+	PUSH(FP);
+	MOV(FP, SP);
+	PUSH(R1);
+	PUSH(R2);
+	PUSH(R3);
+	/* VALUE > 0 */
+	MOV(R1, INDD(IMM(GEN_COUNT), 1));
+	/* INCR COUNTER */
+	INCR(INDD(GEN_COUNT, 1));
+	/* CREATE STRING */
+	MOV(R3, IMM(0)); 
+	/* NUM OF DIGITS */
+  GENSYM_LOOP:
+	CMP(R1, IMM(0));
+	JUMP_EQ(GENSYM_LOOP_END);
+	MOV(R2, R1);
+	DIV(R1, 10);
+	REM(R2, 10);
+	PUSH(R2);
+	CALL(DIGIT_TO_CHAR);
+	DROP(1);
+	PUSH(R0);
+	INCR(R3);
+	JUMP(GENSYM_LOOP);
+  GENSYM_LOOP_END:
+    /* MAKE SOB STRING */
+	MOV(R1, R3); 
+	/* ONE FOR 'G */
+	ADD(R1, IMM(3));
+	PUSH(R1);
+	CALL(MALLOC);
+	DROP(1);
+	MOV(IND(R0), T_STRING);
+	/* N */
+	INCR(R3);
+	MOV(INDD(R0, 1), R3); 
+	MOV(INDD(R0, 2), IMM('G'));
+	/* COPY DIGITS */
+	MOV(R1, R0);
+	ADD(R1, 3);
+	DECR(R3);
+  COPY_DIGITS:
+    CMP(R3, IMM(0));
+	JUMP_EQ(DONE_COPY_DIGITS);
+	POP(IND(R1));
+	INCR(R1);
+	DECR(R3);
+	JUMP(COPY_DIGITS);
+  DONE_COPY_DIGITS:
+    MOV(R2, R0);
+	/* R2 IS T_STRING OBJECT */
+	PUSH(IMM(1)); /* FAKE BUCKET */
+	CALL(MALLOC);
+	DROP(1);
+	MOV(IND(R0), R2);
+
+	/* CREATE T_GENGYM */
+	PUSH(R0);
+	CALL(MAKE_SOB_GENSYM);
+	DROP(1);
+	/* R0 IS T_GENSYM OBJECT */
+	POP(R3);
+	POP(R2);
+	POP(R1);
+	POP(FP);
+	RETURN;

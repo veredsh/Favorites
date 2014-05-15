@@ -1,0 +1,6 @@
+A Compiler for Scheme written in ML
+===================================
+
+Unfortunately, not all of it is written by me, it was a project in pairs, but I can assure you that the readable code is mine :)
+The Assembly-like language is our professor's implementation of Assembly, written in C.
+The main file is compiler.sml  
