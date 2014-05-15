@@ -1,0 +1,8 @@
+Unix Shell
+==========
+Basic implementation of Unix interactive shell including:
+- Printing commands history.
+- Printing environment.
+- Redirection.
+- Pipes.
+- more basic functionalities.
