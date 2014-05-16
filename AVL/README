@@ -1,0 +1,14 @@
+AVL Binary Search Tree
+=======================
+
+In such tree, the heights of the two child sub-trees, of any node in the tree, differ by at most one.
+Lookup, insertion, and deletion all take O(log n) time in both the average and worst cases, where n is the number of nodes in the tree prior to the operation.
+
+Scenario
+--------
+We have a list of lessons that will be conducted in school. Every lesson has a starting hour and duration.
+The school is interested in opening less class rooms as possible with O(log n) calculation time, where n is the number of lessons.
+
+ 
+
+
